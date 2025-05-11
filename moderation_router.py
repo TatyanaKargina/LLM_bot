@@ -8,9 +8,9 @@ from db import (
     get_new_posts, create_session, get_post,
     get_current_post_for_admin, set_post_status,
     get_session_index, get_session_total,
-    advance_session
+    advance_session, end_session
 )
-from gemini import revise_text_with_chatgpt  # исправленный импорт
+from gemini import revise_text_with_chatgpt
 from menu_router import get_main_menu  # Для кнопки "Назад"
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -23,7 +23,6 @@ class GeminiProcessing(StatesGroup):
 logger = logging.getLogger(__name__)
 
 moderation_router = Router()
-pending_gemini_comments = {}
 
 
 @moderation_router.callback_query(F.data == "go_to_moderation")
@@ -50,20 +49,44 @@ async def show_moderation_button(callback: types.CallbackQuery):
 
 
 @moderation_router.callback_query(F.data == "back_to_main")
-async def back_to_main(callback: types.CallbackQuery):
+async def back_to_main(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()  # Очищаем состояние при возврате в главное меню
     await callback.message.edit_text("👋 Главное меню:", reply_markup=get_main_menu())
 
 
 @moderation_router.callback_query(F.data == "start_moderation")
 async def start_moderation(callback: types.CallbackQuery):
     admin_id = callback.from_user.id
+
+    # Проверяем, есть ли уже активная сессия
+    current_post = get_current_post_for_admin(admin_id)
+    if current_post is not None:
+        # Сессия существует - предлагаем продолжить или перезапустить
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="▶️ Продолжить текущую сессию", callback_data="continue_session")],
+            [InlineKeyboardButton(text="🔄 Начать заново", callback_data="restart_session")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+        ])
+        await callback.message.edit_text(
+            "У вас уже есть активная сессия модерации.",
+            reply_markup=keyboard
+        )
+        return
+
+    # Нет активной сессии, создаем новую
     new_posts = get_new_posts()
 
     logger.info(f"🔎 Модерация запущена. Найдено постов: {len(new_posts)}")
     logger.info(f"📝 ID новых постов: {new_posts}")
 
     if not new_posts:
-        await callback.message.edit_text("Нет новых постов для модерации.")
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+        ])
+        await callback.message.edit_text(
+            "Нет новых постов для модерации.",
+            reply_markup=keyboard
+        )
         return
 
     create_session(admin_id, new_posts)
@@ -81,6 +104,27 @@ async def start_moderation(callback: types.CallbackQuery):
         await start_message.delete()
     except Exception as e:
         logger.error(f"Не удалось удалить сообщение о начале модерации: {e}")
+
+
+@moderation_router.callback_query(F.data == "continue_session")
+async def continue_moderation_session(callback: types.CallbackQuery):
+    admin_id = callback.from_user.id
+    start_message = await callback.message.edit_text("Продолжаем модерацию ✅")
+    await send_current_post(admin_id, callback.bot, callback.message.chat.id)
+    await asyncio.sleep(1)
+    try:
+        await start_message.delete()
+    except Exception as e:
+        logger.error(f"Не удалось удалить сообщение: {e}")
+
+
+@moderation_router.callback_query(F.data == "restart_session")
+async def restart_moderation_session(callback: types.CallbackQuery):
+    admin_id = callback.from_user.id
+    # Завершаем текущую сессию
+    end_session(admin_id)
+    # Перенаправляем на start_moderation
+    await start_moderation(callback)
 
 
 async def send_current_post(admin_id: int, bot, chat_id: int):
@@ -116,10 +160,25 @@ async def send_current_post(admin_id: int, bot, chat_id: int):
             InlineKeyboardButton(text="⏳ Отложить", callback_data=f"skip_{post_id}")
         ],
         [InlineKeyboardButton(text="🧠 Обработать (Gemini)", callback_data=f"gemini_{post_id}")],
-        [InlineKeyboardButton(text="🗑 Отклонить", callback_data=f"decline_{post_id}")]
+        [InlineKeyboardButton(text="🗑 Отклонить", callback_data=f"decline_{post_id}")],
+        [InlineKeyboardButton(text="🔙 В меню", callback_data="end_moderation")]
     ])
 
     await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+
+
+@moderation_router.callback_query(F.data == "end_moderation")
+async def end_moderation(callback: types.CallbackQuery, state: FSMContext):
+    admin_id = callback.from_user.id
+
+    # Удаляем сообщение с постом
+    await callback.message.delete()
+
+    # Очищаем сессию
+    end_session(admin_id)
+
+    # Возвращаемся в главное меню
+    await callback.message.answer("👋 Главное меню:", reply_markup=get_main_menu())
 
 
 @moderation_router.callback_query(F.data.startswith(("publish_", "gemini_", "skip_", "decline_")))
@@ -186,15 +245,19 @@ async def handle_post_action(callback: types.CallbackQuery, state: FSMContext):
         await state.update_data(chat_id=callback.message.chat.id)  # Сохраняем chat_id в state
         await state.set_state(GeminiProcessing.waiting_for_comment)
 
+        # Добавляем кнопку отмены
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Отмена", callback_data=f"cancel_gemini_{post_id}")]
+        ])
+
         # Сделаем сообщение более явным, чтобы пользователь понимал, что нужно сделать
         instruction_message = await callback.message.answer(
-            "💬 Теперь введите комментарий, который будет передан в Gemini для редактирования поста.\n"
-            "Пожалуйста, отправьте текстовое сообщение с инструкциями для редактирования."
+            "💬 Введите комментарий для редактирования поста в Gemini:",
+            reply_markup=keyboard
         )
 
         # Сохраняем ID сообщения с инструкцией для последующего удаления
         await state.update_data(instruction_message_id=instruction_message.message_id)
-
 
     elif data.startswith("decline_"):
         post_id = int(data.split("_")[1])
@@ -205,19 +268,54 @@ async def handle_post_action(callback: types.CallbackQuery, state: FSMContext):
             conn.commit()
             conn.close()
             await callback.message.delete()
-        except Exception as e:
-            await callback.message.edit_text(f"❌ Ошибка при удалении поста: {e}")
-            return
 
-        if get_current_post_for_admin(admin_id) is None:
-            await callback.message.answer(
-                "✅ Все посты из сессии обработаны.",
+            # Добавляем сообщение о статусе, которое будет удалено
+            status_message = await callback.message.answer("🗑 Пост удален.")
+
+            # Переходим к следующему посту
+            advance_session(admin_id)
+            await send_current_post(admin_id, callback.bot, callback.message.chat.id)
+
+            # Удаляем сообщение о статусе после задержки
+            await asyncio.sleep(1)
+            await status_message.delete()
+
+        except Exception as e:
+            error_msg = await callback.message.edit_text(
+                f"❌ Ошибка при удалении поста: {e}",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🔙 Вернуться в меню", callback_data="back_to_main")]
+                    [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
                 ])
             )
-        else:
-            await send_current_post(admin_id, callback.bot, callback.message.chat.id)
+            # Удаляем сообщение об ошибке через некоторое время
+            await asyncio.sleep(3)
+            await error_msg.delete()
+            return
+
+
+@moderation_router.callback_query(F.data.startswith("cancel_gemini_"))
+async def cancel_gemini_processing(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    instruction_message_id = data.get('instruction_message_id')
+
+    # Удаляем сообщение с инструкцией
+    if instruction_message_id:
+        try:
+            await callback.bot.delete_message(
+                chat_id=callback.message.chat.id,
+                message_id=instruction_message_id
+            )
+        except Exception as e:
+            logger.error(f"Не удалось удалить сообщение с инструкцией: {e}")
+
+    await state.clear()
+
+    # Показываем кратковременное сообщение об отмене
+    cancel_message = await callback.answer("Редактирование отменено")
+
+    # Продолжаем модерацию текущего поста
+    admin_id = callback.from_user.id
+    await send_current_post(admin_id, callback.bot, callback.message.chat.id)
 
 
 # Обработчик сообщений при ожидании комментария для Gemini
@@ -241,17 +339,26 @@ async def handle_admin_comment(message: types.Message, state: FSMContext):
             logger.error(f"Не удалось удалить сообщение с инструкцией: {e}")
 
     if not post_id:
-        await message.answer("⚠️ Ошибка состояния: не найден ID поста.")
+        error_message = await message.answer("⚠️ Ошибка состояния: не найден ID поста.")
         await state.clear()
+        # Удаляем сообщение об ошибке через некоторое время
+        await asyncio.sleep(3)
+        await error_message.delete()
         return
 
     post = get_post(post_id)
     if not post:
-        await message.answer("⚠️ Пост не найден.")
+        error_message = await message.answer("⚠️ Пост не найден.")
         await state.clear()
+        # Удаляем сообщение об ошибке через некоторое время
+        await asyncio.sleep(3)
+        await error_message.delete()
         return
 
     raw_text = post[2]
+
+    # Показываем сообщение о процессе обработки
+    processing_message = await message.answer("⏳ Обрабатываю пост с помощью Gemini...")
 
     # Добавляем больше логов для отладки
     logger.info(f"🔍 Начинаем обработку поста {post_id} с комментарием: {message.text}")
@@ -265,6 +372,9 @@ async def handle_admin_comment(message: types.Message, state: FSMContext):
         cursor.execute("UPDATE news SET styled_text = ?, status = ? WHERE id = ?", (revised_text, "pending", post_id))
         conn.commit()
         conn.close()
+
+        # Удаляем сообщение о процессе обработки
+        await processing_message.delete()
 
         # Сообщаем, что пост был обработан
         success_message = await message.answer("✅ Пост успешно обработан Gemini. Вот результат:")
@@ -286,11 +396,26 @@ async def handle_admin_comment(message: types.Message, state: FSMContext):
 
     except Exception as e:
         logger.error(f"❌ Ошибка при обработке поста: {e}")
-        error_message = await message.answer(f"❌ Произошла ошибка при обработке поста: {e}")
+
+        # Удаляем сообщение о процессе обработки
+        await processing_message.delete()
+
+        # Отправляем сообщение об ошибке с кнопками для дальнейших действий
+        error_message = await message.answer(
+            f"❌ Произошла ошибка при обработке поста: {e}\n"
+            "Хотите попробовать еще раз или вернуться к модерации?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data=f"gemini_{post_id}")],
+                [InlineKeyboardButton(text="🔙 Вернуться к модерации", callback_data="continue_session")]
+            ])
+        )
 
         # Удаляем сообщение об ошибке через некоторое время
-        await asyncio.sleep(3)  # Даем больше времени, чтобы прочитать сообщение об ошибке
-        await error_message.delete()
+        await asyncio.sleep(5)
+        try:
+            await error_message.delete()
+        except Exception:
+            pass
 
     # В любом случае очищаем состояние
     await state.clear()

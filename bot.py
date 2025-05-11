@@ -10,6 +10,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram import Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # Настройка логов
@@ -35,7 +36,7 @@ async def background_check_for_news():
     await asyncio.sleep(3)  # Пауза перед стартом
 
     while True:
-        from db import get_unnotified_posts, mark_posts_notified
+        from db import get_unnotified_posts, mark_posts_notified, get_current_post_for_admin
 
         post_ids = get_unnotified_posts()
         if post_ids:
@@ -44,16 +45,32 @@ async def background_check_for_news():
             ])
 
             for admin_id in ADMIN_CHAT_IDS:
+                # Пропускаем админов, которые уже в сессии модерации
+                if get_current_post_for_admin(admin_id) is not None:
+                    logging.info(f"Админ {admin_id} уже в сессии модерации, пропускаем уведомление")
+                    continue
+
                 text = f"📬 Получено <b>{len(post_ids)}</b> новых постов."
                 try:
                     if admin_id in last_notification:
-                        await bot.edit_message_text(
-                            chat_id=admin_id,
-                            message_id=last_notification[admin_id],
-                            text=text,
-                            reply_markup=keyboard
-                        )
-                        logging.info(f"🔁 Обновлено уведомление для {admin_id}")
+                        # Проверяем, существует ли сообщение
+                        try:
+                            await bot.edit_message_text(
+                                chat_id=admin_id,
+                                message_id=last_notification[admin_id],
+                                text=text,
+                                reply_markup=keyboard
+                            )
+                            logging.info(f"🔁 Обновлено уведомление для {admin_id}")
+                        except Exception:
+                            # Если сообщение не найдено, отправляем новое
+                            sent = await bot.send_message(
+                                chat_id=admin_id,
+                                text=text,
+                                reply_markup=keyboard
+                            )
+                            last_notification[admin_id] = sent.message_id
+                            logging.info(f"📤 Отправлено новое уведомление администратору {admin_id}")
                     else:
                         sent = await bot.send_message(
                             chat_id=admin_id,

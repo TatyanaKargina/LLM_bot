@@ -3,18 +3,27 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart
 import json
 import os
+import asyncio
+import logging
 
 from config import ADMIN_CHAT_IDS
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.exceptions import TelegramBadRequest
-from config import ADMIN_CHAT_IDS
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+
+
+# Состояния для FSM
+class ChannelManagement(StatesGroup):
+    adding_channels = State()
+    deleting_channels = State()
+
 
 menu_router = Router()
-user_state = {}
-CHANNELS_FILE = "channels.json"
 monitoring_active = set()
+CHANNELS_FILE = "channels.json"
+logger = logging.getLogger(__name__)
 
 
 def load_channels():
@@ -50,19 +59,43 @@ async def clear_command(message: Message):
     if message.from_user.id not in ADMIN_CHAT_IDS:
         return
 
-    chat_id = message.chat.id
-    bot = message.bot
+    # Удаляем сообщение с командой
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.error(f"Не удалось удалить сообщение с командой: {e}")
 
+    # Отправляем временное сообщение о процессе очистки
+    processing_msg = await message.answer("🧹 Очищаю историю сообщений...")
+
+    # Получаем историю чата и удаляем сообщения от бота
     deleted = 0
-    # Пробуем удалить последние 50 сообщений бота
-    for i in range(message.message_id - 1, message.message_id - 50, -1):
-        try:
-            await bot.delete_message(chat_id, i)
-            deleted += 1
-        except TelegramBadRequest:
-            continue  # сообщение не найдено или уже удалено
+    messages_to_delete = []
 
-    await bot.send_message(chat_id, "👋 Главное меню:", reply_markup=get_main_menu())
+    async for msg in message.bot.get_chat_history(message.chat.id, limit=100):
+        # Удаляем только сообщения от бота
+        if msg.from_user and msg.from_user.id == message.bot.id:
+            messages_to_delete.append(msg.message_id)
+            deleted += 1
+
+    # Удаляем пакетами, чтобы избежать ограничений скорости
+    for i in range(0, len(messages_to_delete), 10):
+        batch = messages_to_delete[i:i + 10]
+        for msg_id in batch:
+            try:
+                await message.bot.delete_message(message.chat.id, msg_id)
+            except Exception as e:
+                logger.error(f"Не удалось удалить сообщение {msg_id}: {e}")
+        await asyncio.sleep(0.5)  # Избегаем ограничений скорости
+
+    # Удаляем сообщение о процессе
+    try:
+        await processing_msg.delete()
+    except Exception:
+        pass
+
+    # Отправляем главное меню
+    await message.answer(f"👋 Очищено {deleted} сообщений.", reply_markup=get_main_menu())
 
 
 @menu_router.callback_query(F.data == "manage_channels")
@@ -81,56 +114,101 @@ async def show_channels(callback: types.CallbackQuery):
 
 
 @menu_router.callback_query(F.data == "add_channel")
-async def prompt_add_channel(callback: types.CallbackQuery):
-    user_state[callback.from_user.id] = "adding"
-    await callback.message.edit_text("Введите каналы через запятую или пробел:")
+async def prompt_add_channel(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(ChannelManagement.adding_channels)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Отмена", callback_data="cancel_channel_operation")]
+    ])
+    await callback.message.edit_text(
+        "Введите каналы через запятую или пробел:",
+        reply_markup=keyboard
+    )
 
 
 @menu_router.callback_query(F.data == "delete_channel")
-async def prompt_delete_channel(callback: types.CallbackQuery):
-    user_state[callback.from_user.id] = "deleting"
-    await callback.message.edit_text("Введите канал(ы), которые хотите удалить:")
+async def prompt_delete_channel(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(ChannelManagement.deleting_channels)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Отмена", callback_data="cancel_channel_operation")]
+    ])
+    await callback.message.edit_text(
+        "Введите канал(ы), которые хотите удалить:",
+        reply_markup=keyboard
+    )
 
 
-@menu_router.callback_query(F.data == "back_to_main")
-async def back_to_main(callback: types.CallbackQuery):
+@menu_router.callback_query(F.data == "cancel_channel_operation")
+async def cancel_channel_operation(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
     await callback.message.edit_text("👋 Главное меню:", reply_markup=get_main_menu())
 
 
-# Изменяем обработчик текстовых сообщений - добавляем проверку на состояние FSM
-@menu_router.message(F.text)
-async def handle_channel_input(message: types.Message, state: FSMContext):
-    # Получаем текущее состояние FSM
-    current_state = await state.get_state()
+@menu_router.callback_query(F.data == "back_to_main")
+async def back_to_main(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()  # Очищаем состояние при возврате в главное меню
+    await callback.message.edit_text("👋 Главное меню:", reply_markup=get_main_menu())
 
-    # Если пользователь находится в каком-либо состоянии FSM, 
-    # не обрабатываем сообщение в этом обработчике
-    if current_state is not None:
-        return
 
-    user_id = message.from_user.id
-    if user_id not in user_state:
-        return
-
-    action = user_state.pop(user_id)
+@menu_router.message(ChannelManagement.adding_channels)
+async def handle_add_channels(message: types.Message, state: FSMContext):
     input_text = message.text.strip()
     channels = load_channels()
 
     input_channels = [c.strip().lstrip("@") for c in input_text.replace(",", " ").split()]
     input_channels = list(set(input_channels))  # Удаляем дубли
 
-    if action == "adding":
-        new_channels = [f"@{c}" for c in input_channels if f"@{c}" not in channels]
-        channels.extend(new_channels)
-        save_channels(channels)
-        await message.answer(f"✅ Добавлено каналов: {len(new_channels)}")
-    elif action == "deleting":
-        removed = [f"@{c}" for c in input_channels if f"@{c}" in channels]
-        channels = [c for c in channels if c not in removed]
-        save_channels(channels)
-        await message.answer(f"🗑️ Удалено каналов: {len(removed)}")
+    new_channels = [f"@{c}" for c in input_channels if f"@{c}" not in channels]
+    channels.extend(new_channels)
+    save_channels(channels)
 
-    await message.answer("👋 Главное меню:", reply_markup=get_main_menu())
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.error(f"Не удалось удалить сообщение пользователя: {e}")
+
+    # Отправляем статусное сообщение и затем удаляем его
+    status_msg = await message.answer(f"✅ Добавлено каналов: {len(new_channels)}")
+    await state.clear()
+
+    main_menu_msg = await message.answer("👋 Главное меню:", reply_markup=get_main_menu())
+
+    # Удаляем статусное сообщение после задержки
+    await asyncio.sleep(2)
+    try:
+        await status_msg.delete()
+    except Exception as e:
+        logger.error(f"Не удалось удалить статусное сообщение: {e}")
+
+
+@menu_router.message(ChannelManagement.deleting_channels)
+async def handle_delete_channels(message: types.Message, state: FSMContext):
+    input_text = message.text.strip()
+    channels = load_channels()
+
+    input_channels = [c.strip().lstrip("@") for c in input_text.replace(",", " ").split()]
+    removed = [f"@{c}" for c in input_channels if f"@{c}" in channels]
+    channels = [c for c in channels if c not in removed]
+    save_channels(channels)
+
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.error(f"Не удалось удалить сообщение пользователя: {e}")
+
+    # Отправляем статусное сообщение и затем удаляем его
+    status_msg = await message.answer(f"🗑️ Удалено каналов: {len(removed)}")
+    await state.clear()
+
+    main_menu_msg = await message.answer("👋 Главное меню:", reply_markup=get_main_menu())
+
+    # Удаляем статусное сообщение после задержки
+    await asyncio.sleep(2)
+    try:
+        await status_msg.delete()
+    except Exception as e:
+        logger.error(f"Не удалось удалить статусное сообщение: {e}")
 
 
 @menu_router.callback_query(F.data == "start_monitoring")
@@ -143,8 +221,8 @@ async def start_monitoring(callback: types.CallbackQuery):
         text = "✅ Мониторинг запущен."
 
     keyboard = [
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")],
-        [InlineKeyboardButton(text="🛑 Завершить мониторинг", callback_data="stop_monitoring")]
+        [InlineKeyboardButton(text="🛑 Завершить мониторинг", callback_data="stop_monitoring")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
     ]
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
 
@@ -153,4 +231,7 @@ async def start_monitoring(callback: types.CallbackQuery):
 async def stop_monitoring(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     monitoring_active.discard(user_id)
-    await callback.message.edit_text("🛑 Мониторинг остановлен.", reply_markup=get_main_menu())
+    await callback.message.edit_text(
+        "🛑 Мониторинг остановлен.",
+        reply_markup=get_main_menu()
+    )

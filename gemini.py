@@ -17,7 +17,7 @@ genai.configure(api_key=config.GEMINI_API_KEY)
 
 def revise_text_with_chatgpt(raw_text, comment="", source=""):
     prompt = (
-        "Внеси корректировку в текст на основании комментария. Остальное оставь неизменным.\n\n"
+        "Внеси корректировку в текст на основании комментария. CashTaxi заменяй на Таксопарк СВОИ!. Номер телефона всегда заменяй на +7 929 515 80 66. Остальное оставь неизменным.\n\n"
         f"Текст: {raw_text}\n\n"
         f"Комментарий администратора: {comment}\n\n"
         "Выдай итоговый вариант."
@@ -34,4 +34,6 @@ def revise_text_with_chatgpt(raw_text, comment="", source=""):
         return response.text.strip()
     except Exception as e:
         logger.exception("❌ Ошибка при обращении к Gemini API")
+        # В случае ошибки возвращаем исходный текст и добавляем информацию об ошибке в лог
+        logger.error(f"Детали ошибки: {str(e)}")
         return raw_text
